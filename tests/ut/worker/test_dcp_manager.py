@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from vllm_ascend.attention.utils import AscendDCPMetadata
-from vllm_ascend.worker.dcp_utils import DCPManager
+from vllm_ascend.worker.dcp_utils import DCPManager, _build_mtp_req_positions
 
 
 def _make_dcp_manager(
@@ -363,3 +363,166 @@ def test_update_spec_decode_drafting_metadata_prioritizes_sfa_dcp() -> None:
         manager._get_dcp_local_seq_lens.call_args.args[0],
         torch.tensor([9, 13], dtype=torch.int32),
     )
+
+
+def _reference_mtp_layout(
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    cu_num_tokens: np.ndarray,
+    num_reqs: int,
+    extra_tokens: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    req_indices_split = np.array_split(req_indices, cu_num_tokens)[:num_reqs]
+    positions_split = np.array_split(positions_np, cu_num_tokens)[:num_reqs]
+    for req_idx in range(num_reqs):
+        if req_indices_split[req_idx].size == 0:
+            continue
+        req_indices_split[req_idx] = np.append(
+            req_indices_split[req_idx],
+            np.repeat(req_indices_split[req_idx][-1], extra_tokens),
+        )
+        positions_split[req_idx] = np.append(
+            positions_split[req_idx],
+            np.arange(
+                positions_split[req_idx][-1] + 1,
+                positions_split[req_idx][-1] + extra_tokens + 1,
+            ),
+        )
+    return np.concatenate(req_indices_split), np.concatenate(positions_split)
+
+
+def _make_mtp_batch(lens: list[int], base_positions: list[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    lens_arr = np.array(lens, dtype=np.int32)
+    cu_num_tokens = np.cumsum(lens_arr, dtype=np.int32)
+    total = int(cu_num_tokens[-1])
+    req_indices = np.repeat(np.arange(len(lens), dtype=np.int32), lens_arr)
+    starts = np.repeat(np.array(base_positions, dtype=np.int64), lens_arr)
+    offsets = np.arange(total, dtype=np.int64) - np.repeat(cu_num_tokens.astype(np.int64) - lens_arr, lens_arr)
+    return req_indices, starts + offsets, cu_num_tokens
+
+
+@pytest.mark.parametrize(
+    "lens, base_positions, extra_tokens",
+    [
+        ([1], [100], 1),
+        ([1], [100], 3),
+        ([1, 1, 1, 1], [10, 20, 30, 40], 2),
+        ([4, 0, 4], [0, 5, 9], 2),
+        ([0, 1, 0, 1, 0], [0, 0, 7, 0, 0], 3),
+        ([1, 2, 3, 0, 5], [0, 1, 3, 0, 6], 1),
+        ([1] * 128, list(range(1000, 1128)), 3),
+    ],
+)
+def test_build_mtp_req_positions_matches_reference(
+    lens: list[int], base_positions: list[int], extra_tokens: int
+) -> None:
+    req_indices, positions_np, cu_num_tokens = _make_mtp_batch(lens, base_positions)
+
+    expected_req_indices, expected_positions = _reference_mtp_layout(
+        req_indices, positions_np, cu_num_tokens, len(lens), extra_tokens
+    )
+    actual_req_indices, actual_positions = _build_mtp_req_positions(
+        req_indices, positions_np, cu_num_tokens, len(lens), extra_tokens
+    )
+
+    assert actual_req_indices.dtype == req_indices.dtype
+    assert actual_positions.dtype == positions_np.dtype
+    np.testing.assert_array_equal(actual_req_indices, expected_req_indices)
+    np.testing.assert_array_equal(actual_positions, expected_positions)
+
+
+def test_should_rebuild_async_spec_decode_inputs() -> None:
+    manager = object.__new__(DCPManager)
+    manager.num_decode_reqs = 2
+    counts = torch.tensor([2, 2])
+
+    assert manager.should_rebuild_async_spec_decode_inputs(True, counts, {"a": 0})
+    assert not manager.should_rebuild_async_spec_decode_inputs(False, counts, {"a": 0})
+    assert not manager.should_rebuild_async_spec_decode_inputs(True, None, {"a": 0})
+    assert not manager.should_rebuild_async_spec_decode_inputs(True, counts, {})
+    manager.num_decode_reqs = 0
+    assert not manager.should_rebuild_async_spec_decode_inputs(True, counts, {"a": 0})
+
+
+def test_generate_dcp_mtp_input_defer_draft_slot_keeps_structure() -> None:
+    manager = object.__new__(DCPManager)
+    manager.num_reqs = 2
+    manager.use_async_scheduling = True
+    manager.decode_threshold = 4
+    manager.query_start_loc_full = MagicMock()
+    manager.query_start_loc_full.np = np.zeros(5, dtype=np.int32)
+    manager.async_rebuild_req_indices = None
+    manager.async_rebuild_cu_num_tokens = None
+    manager.async_rebuild_num_tokens = 0
+    manager.mtp_slot_mapping_buf = MagicMock()
+    manager.mtp_slot_mapping_buf.numel.return_value = 16
+    input_batch = MagicMock()
+    input_batch.req_ids = ["request-0", "request-1"]
+
+    req_indices = np.array([0, 0, 1, 1, 1], dtype=np.int32)
+    cu_num_tokens = np.array([2, 5], dtype=np.int32)
+    manager.generate_dcp_mtp_input(
+        total_num_scheduled_tokens=5,
+        num_scheduled_tokens={"request-0": 2, "request-1": 3},
+        input_batch=input_batch,
+        req_indices=req_indices,
+        positions_np=np.arange(5, dtype=np.int64),
+        cu_num_tokens=cu_num_tokens,
+        defer_draft_slot=True,
+    )
+
+    np.testing.assert_array_equal(
+        manager.query_start_loc_full.np,
+        np.array([0, 2, 5, -1, -1], dtype=np.int32),
+    )
+    manager.query_start_loc_full.copy_to_gpu.assert_called_once_with()
+    input_batch.block_table.compute_slot_mapping_draft.assert_not_called()
+    manager.mtp_slot_mapping_buf.__getitem__.assert_not_called()
+    np.testing.assert_array_equal(manager.async_rebuild_req_indices, req_indices)
+    np.testing.assert_array_equal(manager.async_rebuild_cu_num_tokens, cu_num_tokens)
+    assert manager.async_rebuild_num_tokens == 5
+
+
+def test_generate_dcp_mtp_input_reuses_slot_buffer() -> None:
+    manager = object.__new__(DCPManager)
+    manager.num_reqs = 2
+    manager.use_async_scheduling = False
+    manager.decode_threshold = 3
+    manager.query_start_loc_full = MagicMock()
+    manager.query_start_loc_full.np = np.zeros(5, dtype=np.int32)
+    manager.mtp_slot_mapping_buf = MagicMock()
+    manager.mtp_slot_mapping_buf.numel.return_value = 16
+    slot_view = MagicMock()
+    manager.mtp_slot_mapping_buf.__getitem__.return_value = slot_view
+    input_batch = MagicMock()
+    input_batch.req_ids = ["request-0", "request-1"]
+
+    manager.generate_dcp_mtp_input(
+        total_num_scheduled_tokens=5,
+        num_scheduled_tokens={"request-0": 2, "request-1": 3},
+        input_batch=input_batch,
+        req_indices=np.array([0, 0, 1, 1, 1], dtype=np.int32),
+        positions_np=np.arange(5, dtype=np.int64),
+        cu_num_tokens=np.array([2, 5], dtype=np.int32),
+    )
+
+    slot_mapping_cpu = input_batch.block_table.block_tables[0].slot_mapping.cpu
+    input_batch.block_table.compute_slot_mapping_draft.assert_called_once()
+    manager.mtp_slot_mapping_buf.__getitem__.assert_called_with(slice(None, 7))
+    slot_view.copy_.assert_called_once_with(slot_mapping_cpu[:7], non_blocking=True)
+    assert manager.mtp_slot_mapping is slot_view
+
+
+def test_ensure_mtp_slot_buffer_is_allocated_lazily() -> None:
+    manager = object.__new__(DCPManager)
+    manager.max_num_tokens = 32
+    manager.max_num_reqs = 4
+    manager.decode_threshold = 3
+    manager.device = torch.device("cpu")
+    manager.mtp_slot_mapping_buf = None
+
+    buf = manager._ensure_mtp_slot_buffer(8)
+
+    assert buf.numel() == 36
+    assert buf.dtype == torch.int32
+    assert manager._ensure_mtp_slot_buffer(8) is buf

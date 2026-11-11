@@ -72,6 +72,36 @@ class DCPAsyncSpecDecodeRebuildResult:
     positions_ready_on_device: bool
 
 
+def _build_mtp_req_positions(
+    req_indices: np.ndarray,
+    positions_np: np.ndarray,
+    cu_num_tokens: np.ndarray,
+    num_reqs: int,
+    extra_tokens: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Append ``extra_tokens`` draft steps to every request's scheduled run.
+
+    Request ``r`` owns the contiguous run ``[cu[r-1], cu[r])`` of ``req_indices``
+    and ``positions_np``; it keeps that run in order and continues it with
+    ``extra_tokens`` positions past its last one. Requests without scheduled
+    tokens contribute nothing.
+    """
+    lens = np.diff(cu_num_tokens, prepend=0)[:num_reqs].astype(np.int64)
+    out_lens = lens + extra_tokens * (lens > 0)
+    out_starts = np.cumsum(out_lens) - out_lens
+    pos_in_req = np.arange(int(out_lens.sum()), dtype=np.int64) - np.repeat(out_starts, out_lens)
+    lens_rep = np.repeat(lens, out_lens)
+    is_draft = pos_in_req >= lens_rep
+    src = np.repeat(cu_num_tokens[:num_reqs].astype(np.int64) - lens, out_lens) + np.minimum(pos_in_req, lens_rep - 1)
+    req_indices_mtp = np.where(
+        is_draft,
+        np.repeat(np.arange(num_reqs, dtype=req_indices.dtype), out_lens),
+        req_indices[src],
+    )
+    positions_mtp = positions_np[src] + np.where(is_draft, pos_in_req - lens_rep + 1, 0)
+    return req_indices_mtp, positions_mtp
+
+
 class DCPManager:
     """Manage Decode Context Parallel metadata and reusable buffers."""
 
@@ -119,6 +149,8 @@ class DCPManager:
             pin_memory=pin_memory,
         )
         self.mtp_slot_mapping: torch.Tensor | None = None
+        # Allocated on first use: only the v1 slot-table path needs it.
+        self.mtp_slot_mapping_buf: torch.Tensor | None = None
         # GQA and MLA use history/current split attention, so no
         # per-request mask spanning the DCP-local cache is needed.
         self.dcp_mtp_attn_mask = None
@@ -333,6 +365,20 @@ class DCPManager:
             slot_mapping=slot_mapping,
         )
 
+    def should_rebuild_async_spec_decode_inputs(
+        self,
+        use_async_spec_decode: bool,
+        valid_sampled_token_count_gpu: torch.Tensor | None,
+        prev_req_id_to_index: Any,
+    ) -> bool:
+        """Whether this step rebuilds the speculative inputs after the counts sync."""
+        return (
+            use_async_spec_decode
+            and valid_sampled_token_count_gpu is not None
+            and bool(prev_req_id_to_index)
+            and self.num_decode_reqs > 0
+        )
+
     def rebuild_async_spec_decode_inputs(
         self,
         *,
@@ -368,13 +414,11 @@ class DCPManager:
         prepare_input_ids: Callable[["SchedulerOutput", int, int, np.ndarray], None],
     ) -> DCPAsyncSpecDecodeRebuildResult:
         del draft_token_ids
-        should_rebuild = (
-            use_async_spec_decode
-            and valid_sampled_token_count_gpu is not None
-            and bool(prev_req_id_to_index)
-            and self.num_decode_reqs > 0
-        )
-        if not should_rebuild:
+        if not self.should_rebuild_async_spec_decode_inputs(
+            use_async_spec_decode,
+            valid_sampled_token_count_gpu,
+            prev_req_id_to_index,
+        ):
             return DCPAsyncSpecDecodeRebuildResult(False, False)
 
         can_rebuild_on_device = (
@@ -408,8 +452,12 @@ class DCPManager:
                     num_computed_tokens[req_indices_mtp].to(torch.int64) + mtp_offsets - mtp_start_loc[req_indices_mtp]
                 )
                 input_batch.block_table.compute_slot_mapping_draft(req_indices_mtp, positions_mtp)
+                # Snapshot before the verify step overwrites the block table's
+                # slot mapping; the persistent buffer avoids a per-step clone.
                 slot_mapping = input_batch.block_table.block_tables[0].slot_mapping.gpu[:num_tokens_mtp]
-                self.mtp_slot_mapping = slot_mapping.clone()
+                mtp_buf = self._ensure_mtp_slot_buffer(num_tokens_mtp)
+                mtp_buf[:num_tokens_mtp].copy_(slot_mapping)
+                self.mtp_slot_mapping = mtp_buf[:num_tokens_mtp]
             return DCPAsyncSpecDecodeRebuildResult(True, True)
 
         base_num_computed_tokens = num_computed_tokens_cpu[:num_reqs].copy()
@@ -472,6 +520,19 @@ class DCPManager:
         )
         return DCPAsyncSpecDecodeRebuildResult(True, False)
 
+    def _ensure_mtp_slot_buffer(self, num_tokens: int) -> torch.Tensor:
+        """Return the persistent draft slot buffer, allocating it on first use."""
+        buf = self.mtp_slot_mapping_buf
+        if buf is None:
+            buf = torch.empty(
+                self.max_num_tokens + self.max_num_reqs * max(self.decode_threshold - 2, 0),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.mtp_slot_mapping_buf = buf
+        assert num_tokens <= buf.numel()
+        return buf
+
     def generate_dcp_mtp_input(
         self,
         total_num_scheduled_tokens: int,
@@ -487,6 +548,7 @@ class DCPManager:
         num_spec_tokens: int | None = None,
         precomputed_positions_np: np.ndarray | None = None,
         prev_positions: torch.Tensor | None = None,
+        defer_draft_slot: bool = False,
     ) -> None:
         del (
             total_num_scheduled_tokens,
@@ -519,29 +581,24 @@ class DCPManager:
 
         if self.decode_threshold <= 2:
             return
+        # A later async rebuild in this same step regenerates the draft slots,
+        # so building them here would only burn CPU before the counts sync.
+        if defer_draft_slot:
+            return
         extra_tokens = self.decode_threshold - 2
-        req_indices_split = np.array_split(req_indices, cu_num_tokens)[: self.num_reqs]
-        positions_split = np.array_split(positions_np, cu_num_tokens)[: self.num_reqs]
-        for req_idx in range(self.num_reqs):
-            if req_indices_split[req_idx].size == 0:
-                continue
-            req_indices_split[req_idx] = np.append(
-                req_indices_split[req_idx],
-                np.repeat(req_indices_split[req_idx][-1], extra_tokens),
-            )
-            positions_split[req_idx] = np.append(
-                positions_split[req_idx],
-                np.arange(
-                    positions_split[req_idx][-1] + 1,
-                    positions_split[req_idx][-1] + extra_tokens + 1,
-                ),
-            )
-        req_indices_mtp = np.concatenate(req_indices_split)
-        positions_mtp = np.concatenate(positions_split)
+        req_indices_mtp, positions_mtp = _build_mtp_req_positions(
+            req_indices,
+            positions_np,
+            cu_num_tokens,
+            self.num_reqs,
+            extra_tokens,
+        )
         input_batch.block_table.compute_slot_mapping_draft(req_indices_mtp, positions_mtp)
         num_tokens_mtp = req_indices_mtp.shape[0]
         slot_mapping = input_batch.block_table.block_tables[0].slot_mapping.cpu[:num_tokens_mtp]
-        self.mtp_slot_mapping = slot_mapping.pin_memory().to(self.device, non_blocking=True)
+        mtp_buf = self._ensure_mtp_slot_buffer(num_tokens_mtp)
+        mtp_buf[:num_tokens_mtp].copy_(slot_mapping, non_blocking=True)
+        self.mtp_slot_mapping = mtp_buf[:num_tokens_mtp]
 
     def _get_dcp_local_seq_lens(
         self,

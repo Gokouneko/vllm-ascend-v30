@@ -1355,6 +1355,9 @@ class NPUModelRunner(GPUModelRunner):
             prev_positions_gpu = self.prev_positions.gpu[:num_reqs]
 
         if self.speculative_config and self.use_dcp:
+            # Only the structural part is needed here. When the async rebuild
+            # below is going to run, it regenerates the draft slot table, so
+            # building it now would be wasted CPU before the counts sync.
             self.dcp_manager.generate_dcp_mtp_input(
                 total_num_scheduled_tokens,
                 scheduler_output.num_scheduled_tokens,
@@ -1368,6 +1371,11 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output,
                 self.num_spec_tokens,
                 prev_positions=prev_positions_gpu,
+                defer_draft_slot=self.dcp_manager.should_rebuild_async_spec_decode_inputs(
+                    self.use_async_spec_decode,
+                    self.valid_sampled_token_count_gpu,
+                    prev_req_id_to_index,
+                ),
             )
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
@@ -1587,11 +1595,10 @@ class NPUModelRunner(GPUModelRunner):
         elif cp_async_rebuild.rebuilt:
             # The async rebuild computed corrected positions on CPU.
             # Copy positions_np to GPU so input_ids and positions stay aligned.
-
+            # positions_np is a view of _positions_cpu_buf, so copy it directly
+            # instead of materializing a temporary device tensor.
             self.positions[:total_num_scheduled_tokens].copy_(
-                torch.from_numpy(
-                    positions_np[:total_num_scheduled_tokens]
-                ).to(self.device),
+                self._positions_cpu_buf[:total_num_scheduled_tokens],
                 non_blocking=True,
             )
         else:
